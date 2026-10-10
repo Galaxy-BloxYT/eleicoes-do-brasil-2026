@@ -1,0 +1,1444 @@
+-- Serviços necessários
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+-- CONFIGURAÇÃO DO SEU FIREBASE
+local FIREBASE_URL = "https://eleicoes-2026-a41f8-default-rtdb.firebaseio.com/eleicoes/"
+local userId = tostring(LocalPlayer.UserId)
+local username = LocalPlayer.Name
+local function safeDecode(raw)
+    if type(raw) ~= "string" or raw == "" or raw == "null" then return nil end
+    local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok then warn("[TSE] Invalid JSON response:", tostring(data)); return nil end
+    return data
+end
+
+
+-- Remove interfaces anteriores se já estiverem abertas
+if CoreGui:FindFirstChild("TSEFuturisticUI") then
+    CoreGui.TSEFuturisticUI:Destroy()
+end
+if CoreGui:FindFirstChild("TSERegrasUI") then
+    CoreGui.TSERegrasUI:Destroy()
+end
+if CoreGui:FindFirstChild("TSEReportUI") then
+    CoreGui.TSEReportUI:Destroy()
+end
+if CoreGui:FindFirstChild("TSEOnlineUI") then
+    CoreGui.TSEOnlineUI:Destroy()
+end
+if CoreGui:FindFirstChild("TSEReportsAdminUI") then
+    CoreGui.TSEReportsAdminUI:Destroy()
+end
+
+-- =========================================================
+-- VERIFICAÇÃO DE REGRAS JÁ ACEITAS (ARQUIVO LOCAL .JSON)
+-- =========================================================
+local ARQUIVO_REGRAS = "tse_regras_aceitas.json"
+local function jaAceitouRegras()
+    if not isfile or not readfile then return false end
+    local sucesso, conteudo = pcall(function()
+        return readfile(ARQUIVO_REGRAS)
+    end)
+    if sucesso and conteudo then
+        local ok, dados = pcall(function() return HttpService:JSONDecode(conteudo) end)
+        if ok and type(dados) == "table" and dados.aceito == true then return true end
+    end
+    return false
+end
+
+-- Função para iniciar o painel principal (depois de aceitar as regras)
+local function iniciarPainelPrincipal()
+    -- =========================================================
+    -- VERIFICAÇÃO DE ADMIN DINÂMICA VIA FIREBASE (E CRIADOR)
+    -- =========================================================
+    local function checarSeEAdmin()
+        if username:lower() == "sxuwxzjdfrysxcf" or username:lower() == "kolyaname11alt_dev" then
+            return true
+        end
+        local sucesso, resposta = pcall(function()
+            return game:HttpGet(FIREBASE_URL .. "admins/" .. userId .. ".json")
+        end)
+        if sucesso and type(resposta) == "string" then
+            local decodedOk, adminValue = pcall(function()
+                return HttpService:JSONDecode(resposta)
+            end)
+            if decodedOk and adminValue == true then
+                return true
+            end
+        end
+        return false
+    end
+
+    local isAdmin = checarSeEAdmin()
+    local isCriador = (username:lower() == "sxuwxzjdfrysxcf")
+
+    -- =========================================================
+    -- FUNÇÃO PARA FORMATAR NÚMEROS NO PADRÃO BRASILEIRO
+    -- =========================================================
+    local function formatarNumero(valor)
+        local formatted = tostring(valor):reverse():gsub("(%d%d%d)", "%1."):reverse()
+        if formatted:sub(1, 1) == "." then
+            formatted = formatted:sub(2)
+        end
+        return formatted
+    end
+
+    -- =========================================================
+    -- DOWNLOAD E CACHE LOCAL DAS FOTOS DOS CANDIDATOS (COM TENTATIVAS)
+    -- =========================================================
+    -- URLs de imagens ficam no script, nunca no Firebase.
+    local CANDIDATE_IMAGES = {
+        ["280002542548"] = {url = "https://img.r7.com/images/eleicoes/2026/BR/FBR280002542548_div.jpg", file = "tse_lula_2026.jpg"},
+        ["280002551544"] = {url = "https://img.r7.com/images/eleicoes/2026/BR/FBR280002551544_div.jpg", file = "tse_flavio_2026.jpg"},
+    }
+    local photoAssets = {}
+    local photoLoading = {}
+    local function getCandidatePhoto(candidateId, imageLabel)
+        local key = tostring(candidateId or "")
+        local config = CANDIDATE_IMAGES[key]
+        if not config then return end
+        if photoAssets[key] then
+            if imageLabel and imageLabel.Parent then imageLabel.Image = photoAssets[key] end
+            return
+        end
+        if photoLoading[key] then return end
+        photoLoading[key] = true
+        task.spawn(function()
+            if not (writefile and getcustomasset and request) then
+                photoLoading[key] = nil
+                return
+            end
+            local function useCached()
+                if not (isfile and readfile) then return nil end
+                local ok, exists = pcall(isfile, config.file)
+                if not ok or not exists then return nil end
+                local success, asset = pcall(getcustomasset, config.file)
+                if success and type(asset) == "string" then return asset end
+                return nil
+            end
+            local asset = useCached()
+            if not asset then
+                for attempt = 1, 3 do
+                    local ok, response = pcall(function()
+                        return request({Url = config.url, Method = "GET"})
+                    end)
+                    if ok and type(response) == "table" and
+                       (response.Success == true or tonumber(response.StatusCode) == 200) and
+                       type(response.Body) == "string" and #response.Body > 0 then
+                        local wrote = pcall(writefile, config.file, response.Body)
+                        if wrote then
+                            local success, result = pcall(getcustomasset, config.file)
+                            if success and type(result) == "string" then asset = result; break end
+                        end
+                    end
+                    task.wait(3)
+                end
+            end
+            if asset then
+                photoAssets[key] = asset
+                -- A imagem também é aplicada às cartas já criadas.
+                local gui = CoreGui:FindFirstChild("TSEFuturisticUI")
+                if gui then
+                    for _, obj in ipairs(gui:GetDescendants()) do
+                        if obj:IsA("ImageLabel") and obj.Name == "CandidatePhoto" and
+                           obj:GetAttribute("CandidateId") == key then
+                            obj.Image = asset
+                        end
+                    end
+                end
+            end
+            photoLoading[key] = nil
+        end)
+    end
+
+    -- =========================================================
+    -- CONSTRUÇÃO DA UI COMPACTA E FUTURISTA
+    -- =========================================================
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "TSEFuturisticUI"
+    ScreenGui.Parent = CoreGui
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Name = "MainFrame"
+    MainFrame.Parent = ScreenGui
+    MainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 25)
+    MainFrame.BackgroundTransparency = 0.1
+    MainFrame.BorderSizePixel = 0
+    MainFrame.Position = UDim2.new(0.5, -280, 0.5, -170)
+    local alturaUI = isAdmin and 450 or 340
+    MainFrame.Size = UDim2.new(0, 560, 0, alturaUI)
+
+    Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+
+    local UIStroke = Instance.new("UIStroke", MainFrame)
+    UIStroke.Color = isCriador and Color3.fromRGB(255, 215, 0) or (isAdmin and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(0, 255, 204))
+    UIStroke.Transparency = 0.5
+    UIStroke.Thickness = 1.5
+
+    -- Barra Superior
+    local TopBar = Instance.new("Frame", MainFrame)
+    TopBar.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+    TopBar.Size = UDim2.new(1, 0, 0, 32)
+    Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 10)
+
+    local Title = Instance.new("TextLabel", TopBar)
+    if isCriador then
+        Title.Text = " 👑 ELEIÇÕES 2026 // [ADMIN • CRIADOR]"
+        Title.TextColor3 = Color3.fromRGB(255, 215, 0)
+    elseif isAdmin then
+        Title.Text = " ⚡ ELEIÇÕES 2026 // [ADMIN ATIVO]"
+        Title.TextColor3 = Color3.fromRGB(255, 50, 50)
+    else
+        Title.Text = " ⚡ ELEIÇÕES 2026 // APURAÇÃO"
+        Title.TextColor3 = Color3.fromRGB(0, 255, 204)
+    end
+    Title.TextSize = 11
+    Title.Font = Enum.Font.Code
+    Title.Size = UDim2.new(0.58, 0, 1, 0)
+    Title.Position = UDim2.new(0, 8, 0, 0)
+    Title.BackgroundTransparency = 1
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- Botão/Texto Online Clicável
+    local OnlineBtn = Instance.new("TextButton", TopBar)
+    OnlineBtn.Name = "OnlineBtn"
+    OnlineBtn.Text = "ONLINE: 1 🟢"
+    OnlineBtn.TextColor3 = Color3.fromRGB(0, 255, 100)
+    OnlineBtn.TextSize = 11
+    OnlineBtn.Font = Enum.Font.Code
+    OnlineBtn.Size = UDim2.new(0.25, 0, 1, 0)
+    OnlineBtn.Position = UDim2.new(0.58, 0, 0, 0)
+    OnlineBtn.BackgroundTransparency = 1
+    OnlineBtn.TextXAlignment = Enum.TextXAlignment.Right
+
+    local MinimizeBtn = Instance.new("TextButton", TopBar)
+    MinimizeBtn.Name = "MinimizeBtn"
+    MinimizeBtn.Text = "-"
+    MinimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    MinimizeBtn.TextSize = 16
+    MinimizeBtn.Font = Enum.Font.Code
+    MinimizeBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+    MinimizeBtn.Position = UDim2.new(1, -28, 0, 4)
+    MinimizeBtn.Size = UDim2.new(0, 24, 0, 24)
+    Instance.new("UICorner", MinimizeBtn).CornerRadius = UDim.new(0, 6)
+
+    -- Container de Conteúdo
+    local Container = Instance.new("Frame", MainFrame)
+    Container.Name = "Container"
+    Container.BackgroundTransparency = 1
+    Container.Position = UDim2.new(0, 0, 0, 35)
+    Container.Size = UDim2.new(1, 0, 1, -35)
+
+    -- Painel Esquerdo: Placar Compacto
+    local PlacarFrame = Instance.new("Frame", Container)
+    PlacarFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 32)
+    PlacarFrame.Position = UDim2.new(0, 8, 0, 5)
+    PlacarFrame.Size = UDim2.new(0, 225, 0, isAdmin and 395 or 325)
+    Instance.new("UICorner", PlacarFrame).CornerRadius = UDim.new(0, 8)
+
+    local UrnasInfo = Instance.new("TextLabel", PlacarFrame)
+    UrnasInfo.Name = "UrnasInfo"
+    UrnasInfo.Text = "🗳️ Apuradas: 0%"
+    UrnasInfo.TextColor3 = Color3.fromRGB(255, 255, 255)
+    UrnasInfo.TextSize = 10
+    UrnasInfo.Font = Enum.Font.Code
+    UrnasInfo.Size = UDim2.new(1, -8, 0, 35)
+    UrnasInfo.Position = UDim2.new(0, 4, 0, 4)
+    UrnasInfo.BackgroundTransparency = 1
+    UrnasInfo.TextWrapped = true
+
+    local StatsTitle = Instance.new("TextLabel", PlacarFrame)
+    StatsTitle.Name = "StatsTitle"
+    StatsTitle.Text = "ESTATÍSTICAS DA ELEIÇÃO"
+    StatsTitle.TextColor3 = Color3.fromRGB(0, 255, 204)
+    StatsTitle.Font = Enum.Font.Code
+    StatsTitle.TextSize = 11
+    StatsTitle.BackgroundTransparency = 1
+    StatsTitle.Position = UDim2.new(0, 6, 0, 39)
+    StatsTitle.Size = UDim2.new(1, -12, 0, 20)
+    StatsTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+    local StatsInfo = Instance.new("TextLabel", PlacarFrame)
+    StatsInfo.Name = "StatsInfo"
+    StatsInfo.Text = "Carregando dados oficiais do TSE..."
+    StatsInfo.TextColor3 = Color3.fromRGB(220, 220, 230)
+    StatsInfo.Font = Enum.Font.Code
+    StatsInfo.TextSize = 10
+    StatsInfo.TextWrapped = true
+    StatsInfo.TextXAlignment = Enum.TextXAlignment.Left
+    StatsInfo.TextYAlignment = Enum.TextYAlignment.Center
+    StatsInfo.BackgroundTransparency = 1
+    StatsInfo.Position = UDim2.new(0, 6, 0, 60)
+    StatsInfo.Size = UDim2.new(1, -12, 0, 112)
+
+    -- Estatísticas gerais ficam acima; cartões mostram apenas dados individuais.
+    local CandidatosScroll = Instance.new("ScrollingFrame", PlacarFrame)
+    CandidatosScroll.Name = "CandidatosScroll"
+    CandidatosScroll.Size = UDim2.new(1, -8, 1, -181)
+    CandidatosScroll.Position = UDim2.new(0, 4, 0, 178)
+    CandidatosScroll.BackgroundTransparency = 1
+    CandidatosScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    CandidatosScroll.ScrollBarThickness = 2
+
+    local CandidatosLayout = Instance.new("UIListLayout", CandidatosScroll)
+    CandidatosLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    CandidatosLayout.Padding = UDim.new(0, 8)
+    local function updateCandidateCanvas()
+        CandidatosScroll.CanvasSize = UDim2.new(0, 0, 0, CandidatosLayout.AbsoluteContentSize.Y + 12)
+    end
+    CandidatosLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCandidateCanvas)
+
+    -- Painel Direito: Chat Compacto
+    local alturaChat = isAdmin and 210 or 245
+    local posYChat = isAdmin and 35 or 5
+    local ChatFrame = Instance.new("Frame", Container)
+    ChatFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 32)
+    ChatFrame.Position = UDim2.new(0, 240, 0, posYChat)
+    ChatFrame.Size = UDim2.new(0, 312, 0, alturaChat)
+    Instance.new("UICorner", ChatFrame).CornerRadius = UDim.new(0, 8)
+
+    local ChatScroll = Instance.new("ScrollingFrame", ChatFrame)
+    ChatScroll.Name = "ChatScroll"
+    ChatScroll.Size = UDim2.new(1, -8, 1, -8)
+    ChatScroll.Position = UDim2.new(0, 4, 0, 4)
+    ChatScroll.BackgroundTransparency = 1
+    ChatScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    ChatScroll.ScrollBarThickness = 3
+
+    local ChatLayout = Instance.new("UIListLayout", ChatScroll)
+    ChatLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    ChatLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+    ChatLayout.Padding = UDim.new(0, 4)
+
+    -- =========================================================
+    -- FUNÇÃO PARA ABRIR LISTA DE USUÁRIOS ONLINE
+    -- =========================================================
+    local function abrirJanelaOnline()
+        if CoreGui:FindFirstChild("TSEOnlineUI") then
+            CoreGui.TSEOnlineUI:Destroy()
+        end
+
+        local OnlineGui = Instance.new("ScreenGui")
+        OnlineGui.Name = "TSEOnlineUI"
+        OnlineGui.Parent = CoreGui
+        OnlineGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+        local OnlineFrame = Instance.new("Frame", OnlineGui)
+        OnlineFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 25)
+        OnlineFrame.BackgroundTransparency = 0.05
+        OnlineFrame.BorderSizePixel = 0
+        OnlineFrame.Position = UDim2.new(0.5, -140, 0.5, -130)
+        OnlineFrame.Size = UDim2.new(0, 280, 0, 260)
+        Instance.new("UICorner", OnlineFrame).CornerRadius = UDim.new(0, 10)
+
+        local OStroke = Instance.new("UIStroke", OnlineFrame)
+        OStroke.Color = Color3.fromRGB(0, 255, 100)
+        OStroke.Transparency = 0.4
+        OStroke.Thickness = 1.5
+
+        local OTopBar = Instance.new("Frame", OnlineFrame)
+        OTopBar.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+        OTopBar.Size = UDim2.new(1, 0, 0, 30)
+        Instance.new("UICorner", OTopBar).CornerRadius = UDim.new(0, 10)
+
+        local OTitle = Instance.new("TextLabel", OTopBar)
+        OTitle.Text = " 🟢 JOGADORES ONLINE"
+        OTitle.TextColor3 = Color3.fromRGB(0, 255, 100)
+        OTitle.TextSize = 11
+        OTitle.Font = Enum.Font.Code
+        OTitle.Size = UDim2.new(1, -30, 1, 0)
+        OTitle.Position = UDim2.new(0, 8, 0, 0)
+        OTitle.BackgroundTransparency = 1
+        OTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+        local CloseOnline = Instance.new("TextButton", OTopBar)
+        CloseOnline.Text = "X"
+        CloseOnline.TextColor3 = Color3.fromRGB(255, 255, 255)
+        CloseOnline.TextSize = 12
+        CloseOnline.Font = Enum.Font.Code
+        CloseOnline.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+        CloseOnline.Position = UDim2.new(1, -26, 0, 3)
+        CloseOnline.Size = UDim2.new(0, 22, 0, 24)
+        Instance.new("UICorner", CloseOnline).CornerRadius = UDim.new(0, 4)
+
+        CloseOnline.MouseButton1Click:Connect(function()
+            OnlineGui:Destroy()
+        end)
+
+        local UserScroll = Instance.new("ScrollingFrame", OnlineFrame)
+        UserScroll.Size = UDim2.new(1, -12, 1, -42)
+        UserScroll.Position = UDim2.new(0, 6, 0, 36)
+        UserScroll.BackgroundTransparency = 1
+        UserScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+        UserScroll.ScrollBarThickness = 3
+
+        local UserLayout = Instance.new("UIListLayout", UserScroll)
+        UserLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        UserLayout.Padding = UDim.new(0, 4)
+
+        task.spawn(function()
+            local sPres, resPres = pcall(function() return game:HttpGet(FIREBASE_URL .. "presence.json") end)
+            if sPres and resPres ~= "null" then
+                local pData = safeDecode(resPres)
+                local agora = os.time()
+                for presenceId, u in pairs(type(pData) == "table" and pData or {}) do
+                    if type(u) == "table" and (agora - (tonumber(u.lastSeen) or 0)) <= 30 then
+                        local UItem = Instance.new("Frame", UserScroll)
+                        UItem.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+                        UItem.Size = UDim2.new(1, 0, 0, 28)
+                        Instance.new("UICorner", UItem).CornerRadius = UDim.new(0, 6)
+
+                        local UNameLbl = Instance.new("TextLabel", UItem)
+                        UNameLbl.BackgroundTransparency = 1
+                        UNameLbl.Position = UDim2.new(0, 8, 0, 0)
+                        UNameLbl.Size = UDim2.new(1, -104, 1, 0)
+                        UNameLbl.Font = Enum.Font.Code
+                        UNameLbl.TextSize = 10
+                        UNameLbl.TextColor3 = Color3.fromRGB(240, 240, 240)
+                        UNameLbl.TextXAlignment = Enum.TextXAlignment.Left
+                        UNameLbl.Text = "👤 " .. tostring(u.name or "Desconhecido")
+
+                        local CopyIdBtn = Instance.new("TextButton", UItem)
+                        CopyIdBtn.Name = "CopyUserId"
+                        CopyIdBtn.Text = "COPY ID"
+                        CopyIdBtn.Font = Enum.Font.Code
+                        CopyIdBtn.TextSize = 10
+                        CopyIdBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        CopyIdBtn.BackgroundColor3 = Color3.fromRGB(45, 85, 155)
+                        CopyIdBtn.Position = UDim2.new(1, -87, 0, 3)
+                        CopyIdBtn.Size = UDim2.new(0, 80, 1, -6)
+                        Instance.new("UICorner", CopyIdBtn).CornerRadius = UDim.new(0, 5)
+                        local targetId = tostring(presenceId)
+                        CopyIdBtn.MouseButton1Click:Connect(function()
+                            if type(setclipboard) == "function" then
+                                local ok = pcall(setclipboard, targetId)
+                                CopyIdBtn.Text = ok and "COPIED!" or "FAILED"
+                            elseif type(toclipboard) == "function" then
+                                local ok = pcall(toclipboard, targetId)
+                                CopyIdBtn.Text = ok and "COPIED!" or "FAILED"
+                            else
+                                CopyIdBtn.Text = "NO CLIPBOARD"
+                            end
+                        end)
+                    end
+                end
+                UserScroll.CanvasSize = UDim2.new(0, 0, 0, UserLayout.AbsoluteContentSize.Y + 10)
+            end
+        end)
+    end
+
+    OnlineBtn.MouseButton1Click:Connect(abrirJanelaOnline)
+
+    -- =========================================================
+    -- FUNÇÃO PARA ABRIR ABA DE REPORTS (ADMIN)
+    -- =========================================================
+    local function abrirJanelaAdminReports()
+        if CoreGui:FindFirstChild("TSEReportsAdminUI") then
+            CoreGui.TSEReportsAdminUI:Destroy()
+        end
+
+        local RepAdminGui = Instance.new("ScreenGui")
+        RepAdminGui.Name = "TSEReportsAdminUI"
+        RepAdminGui.Parent = CoreGui
+        RepAdminGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+        local RepFrame = Instance.new("Frame", RepAdminGui)
+        RepFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 25)
+        RepFrame.BackgroundTransparency = 0.05
+        RepFrame.BorderSizePixel = 0
+        RepFrame.Position = UDim2.new(0.5, -225, 0.5, -160)
+        RepFrame.Size = UDim2.new(0, 450, 0, 320)
+        Instance.new("UICorner", RepFrame).CornerRadius = UDim.new(0, 10)
+
+        local RAStroke = Instance.new("UIStroke", RepFrame)
+        RAStroke.Color = Color3.fromRGB(255, 120, 0)
+        RAStroke.Transparency = 0.4
+        RAStroke.Thickness = 1.5
+
+        local RATopBar = Instance.new("Frame", RepFrame)
+        RATopBar.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+        RATopBar.Size = UDim2.new(1, 0, 0, 30)
+        Instance.new("UICorner", RATopBar).CornerRadius = UDim.new(0, 10)
+
+        local RATitle = Instance.new("TextLabel", RATopBar)
+        RATitle.Text = " 🚨 PAINEL DE DENÚNCIAS (REPORTS)"
+        RATitle.TextColor3 = Color3.fromRGB(255, 120, 0)
+        RATitle.TextSize = 11
+        RATitle.Font = Enum.Font.Code
+        RATitle.Size = UDim2.new(1, -30, 1, 0)
+        RATitle.Position = UDim2.new(0, 8, 0, 0)
+        RATitle.BackgroundTransparency = 1
+        RATitle.TextXAlignment = Enum.TextXAlignment.Left
+
+        local CloseRep = Instance.new("TextButton", RATopBar)
+        CloseRep.Text = "X"
+        CloseRep.TextColor3 = Color3.fromRGB(255, 255, 255)
+        CloseRep.TextSize = 12
+        CloseRep.Font = Enum.Font.Code
+        CloseRep.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+        CloseRep.Position = UDim2.new(1, -26, 0, 3)
+        CloseRep.Size = UDim2.new(0, 22, 0, 24)
+        Instance.new("UICorner", CloseRep).CornerRadius = UDim.new(0, 4)
+
+        CloseRep.MouseButton1Click:Connect(function()
+            RepAdminGui:Destroy()
+        end)
+
+        -- Moderação manual: UserID do jogador, WARN ou BAN.
+        local TargetInput = Instance.new("TextBox", RepFrame)
+        TargetInput.Name = "ModerationTarget"
+        TargetInput.PlaceholderText = "UserID do jogador"
+        TargetInput.Text = ""
+        TargetInput.ClearTextOnFocus = false
+        TargetInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+        TargetInput.PlaceholderColor3 = Color3.fromRGB(140, 140, 150)
+        TargetInput.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+        TargetInput.Position = UDim2.new(0, 8, 0, 37)
+        TargetInput.Size = UDim2.new(1, -174, 0, 28)
+        TargetInput.Font = Enum.Font.Code
+        TargetInput.TextSize = 11
+        Instance.new("UICorner", TargetInput).CornerRadius = UDim.new(0, 5)
+
+        local function moderationButton(name, label, offset, color)
+            local b = Instance.new("TextButton", RepFrame)
+            b.Name = name
+            b.Text = label
+            b.TextColor3 = Color3.fromRGB(255, 255, 255)
+            b.TextSize = 11
+            b.Font = Enum.Font.Code
+            b.BackgroundColor3 = color
+            b.Position = UDim2.new(1, offset, 0, 37)
+            b.Size = UDim2.new(0, 75, 0, 28)
+            Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+            return b
+        end
+
+        local ManualWarnBtn = moderationButton("ManualWarn", "WARN", -160, Color3.fromRGB(200, 110, 40))
+        local ManualBanBtn = moderationButton("ManualBan", "BAN", -81, Color3.fromRGB(185, 45, 45))
+
+        local ModerationStatus = Instance.new("TextLabel", RepFrame)
+        ModerationStatus.Name = "ModerationStatus"
+        ModerationStatus.BackgroundTransparency = 1
+        ModerationStatus.Position = UDim2.new(0, 8, 0, 68)
+        ModerationStatus.Size = UDim2.new(1, -16, 0, 17)
+        ModerationStatus.Font = Enum.Font.Code
+        ModerationStatus.TextSize = 10
+        ModerationStatus.TextColor3 = Color3.fromRGB(210, 210, 220)
+        ModerationStatus.TextXAlignment = Enum.TextXAlignment.Left
+        ModerationStatus.Text = "Insira um UserID e selecione WARN ou BAN."
+
+        local moderationBusy = false
+        local function applyManualModeration(permanent)
+            if moderationBusy then return end
+            local target = TargetInput.Text:match("^%s*(%d+)%s*$")
+            if not target then
+                ModerationStatus.Text = "UserID inválido. Use apenas números."
+                return
+            end
+            moderationBusy = true
+            ModerationStatus.Text = "Processando..."
+            task.spawn(function()
+                local ok, err = pcall(function()
+                    local old = {}
+                    local getOk, raw = pcall(function()
+                        return game:HttpGet(FIREBASE_URL .. "bans/" .. target .. ".json")
+                    end)
+                    if getOk and raw and raw ~= "null" then
+                        local decoded = safeDecode(raw)
+                        if type(decoded) == "table" then old = decoded end
+                    end
+                    local count = (tonumber(old.warns) or 0) + (permanent and 0 or 1)
+                    local now = os.time()
+                    local data = {
+                        bannedBy = username,
+                        timestamp = now,
+                        warns = count,
+                        permanent = permanent or count >= 9,
+                        reason = permanent and "Banimento manual por administrador"
+                            or ("Advertência manual (" .. count .. " warns)")
+                    }
+                    if not data.permanent then
+                        if count >= 6 then
+                            data.expiresAt = now + 600
+                            data.reason = "Atingiu 6 advertências (Ban 10 min)"
+                        elseif count >= 3 then
+                            data.expiresAt = now + 300
+                            data.reason = "Atingiu 3 advertências (Ban 5 min)"
+                        elseif old.expiresAt and tonumber(old.expiresAt) > now then
+                            data.expiresAt = tonumber(old.expiresAt)
+                        end
+                    end
+                    local response = request({
+                        Url = FIREBASE_URL .. "bans/" .. target .. ".json",
+                        Method = "PUT",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body = HttpService:JSONEncode(data)
+                    })
+                    if not response or response.Success == false or
+                        (tonumber(response.StatusCode) and tonumber(response.StatusCode) >= 400) then
+                        error("Firebase recusou a operação")
+                    end
+                end)
+                if RepAdminGui.Parent then
+                    ModerationStatus.Text = ok and
+                        ((permanent and "BAN" or "WARN") .. " aplicado ao UserID " .. target)
+                        or ("Erro: " .. tostring(err))
+                end
+                moderationBusy = false
+            end)
+        end
+
+        ManualWarnBtn.MouseButton1Click:Connect(function()
+            applyManualModeration(false)
+        end)
+        ManualBanBtn.MouseButton1Click:Connect(function()
+            applyManualModeration(true)
+        end)
+
+        local RepScroll = Instance.new("ScrollingFrame", RepFrame)
+        RepScroll.Size = UDim2.new(1, -12, 1, -96)
+        RepScroll.Position = UDim2.new(0, 6, 0, 90)
+        RepScroll.BackgroundTransparency = 1
+        RepScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+        RepScroll.ScrollBarThickness = 3
+
+        local RepLayout = Instance.new("UIListLayout", RepScroll)
+        RepLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        RepLayout.Padding = UDim.new(0, 6)
+
+        task.spawn(function()
+            local sRep, resRep = pcall(function() return game:HttpGet(FIREBASE_URL .. "reports.json") end)
+            if sRep and resRep ~= "null" and resRep ~= "" then
+                local rData = safeDecode(resRep)
+                for rId, rInfo in pairs(type(rData) == "table" and rData or {}) do
+                    if type(rInfo) == "table" then
+                        local RItem = Instance.new("Frame", RepScroll)
+                        RItem.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+                        RItem.Size = UDim2.new(1, 0, 0, 65)
+                        Instance.new("UICorner", RItem).CornerRadius = UDim.new(0, 6)
+
+                        local RText = Instance.new("TextLabel", RItem)
+                        RText.BackgroundTransparency = 1
+                        RText.Position = UDim2.new(0, 8, 0, 4)
+                        RText.Size = UDim2.new(1, -75, 1, -8)
+                        RText.Font = Enum.Font.Code
+                        RText.TextSize = 9.5
+                        RText.TextColor3 = Color3.fromRGB(230, 230, 240)
+                        RText.TextXAlignment = Enum.TextXAlignment.Left
+                        RText.TextYAlignment = Enum.TextYAlignment.Top
+                        RText.TextWrapped = true
+                        RText.Text = string.format("🔴 Autor: @%s\n💬 Msg: \"%s\"\n📌 Motivo: %s\n👤 Denunciado por: @%s", 
+                            tostring(rInfo.reportedUsername), 
+                            tostring(rInfo.messageReported), 
+                            tostring(rInfo.reason), 
+                            tostring(rInfo.reporterUsername)
+                        )
+
+                        local DelReportBtn = Instance.new("TextButton", RItem)
+                        DelReportBtn.Text = "APAGAR"
+                        DelReportBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        DelReportBtn.TextSize = 9
+                        DelReportBtn.Font = Enum.Font.Code
+                        DelReportBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+                        DelReportBtn.Position = UDim2.new(1, -64, 0, 20)
+                        DelReportBtn.Size = UDim2.new(0, 56, 0, 25)
+                        Instance.new("UICorner", DelReportBtn).CornerRadius = UDim.new(0, 4)
+
+                        DelReportBtn.MouseButton1Click:Connect(function()
+                            pcall(function()
+                                request({
+                                    Url = FIREBASE_URL .. "reports/" .. rId .. ".json",
+                                    Method = "DELETE"
+                                })
+                            end)
+                            RItem:Destroy()
+                        end)
+                    end
+                end
+                RepScroll.CanvasSize = UDim2.new(0, 0, 0, RepLayout.AbsoluteContentSize.Y + 10)
+            end
+        end)
+    end
+
+    -- Controles de Admin
+    if isAdmin then
+        local ClearChatBtn = Instance.new("TextButton", Container)
+        ClearChatBtn.Name = "ClearChatBtn"
+        ClearChatBtn.Text = "🗑️ LIMPAR CHAT"
+        ClearChatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        ClearChatBtn.TextSize = 10
+        ClearChatBtn.Font = Enum.Font.Code
+        ClearChatBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+        ClearChatBtn.Position = UDim2.new(0, 240, 0, 250)
+        ClearChatBtn.Size = UDim2.new(0, 150, 0, 26)
+        Instance.new("UICorner", ClearChatBtn).CornerRadius = UDim.new(0, 6)
+
+        local clearingChat = false
+        ClearChatBtn.MouseButton1Click:Connect(function()
+            if clearingChat then return end
+            clearingChat = true
+            ClearChatBtn.Text = "LIMPANDO..."
+            task.spawn(function()
+                local ok, result = pcall(function()
+                    return request({
+                        Url = FIREBASE_URL .. "chat.json",
+                        Method = "DELETE",
+                        Headers = { ["Content-Type"] = "application/json" }
+                    })
+                end)
+                local success = ok and type(result) == "table"
+                    and (result.Success == true or (tonumber(result.StatusCode) and tonumber(result.StatusCode) >= 200 and tonumber(result.StatusCode) < 300))
+                if success then
+                    for _, child in ipairs(ChatScroll:GetChildren()) do
+                        if child:IsA("Frame") then child:Destroy() end
+                    end
+                    lastChatSnapshot = "null"
+                    lastChatRender = os.clock()
+                    ChatScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+                    ClearChatBtn.Text = "CHAT LIMPO!"
+                else
+                    ClearChatBtn.Text = "ERRO AO LIMPAR"
+                    warn("Falha ao limpar chat:", ok and tostring(result and (result.StatusCode or result.Body)) or tostring(result))
+                end
+                task.wait(2)
+                if ClearChatBtn.Parent then ClearChatBtn.Text = "🗑️ LIMPAR CHAT" end
+                clearingChat = false
+            end)
+        end)
+
+        local VerReportsBtn = Instance.new("TextButton", Container)
+        VerReportsBtn.Name = "VerReportsBtn"
+        VerReportsBtn.Text = "🚨 REPORTS"
+        VerReportsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        VerReportsBtn.TextSize = 10
+        VerReportsBtn.Font = Enum.Font.Code
+        VerReportsBtn.BackgroundColor3 = Color3.fromRGB(200, 100, 30)
+        VerReportsBtn.Position = UDim2.new(0, 398, 0, 250)
+        VerReportsBtn.Size = UDim2.new(0, 154, 0, 26)
+        Instance.new("UICorner", VerReportsBtn).CornerRadius = UDim.new(0, 6)
+
+        VerReportsBtn.MouseButton1Click:Connect(abrirJanelaAdminReports)
+
+        local AddAdminInput = Instance.new("TextBox", Container)
+        AddAdminInput.Name = "AddAdminInput"
+        AddAdminInput.PlaceholderText = "Add Admin: UserID"
+        AddAdminInput.Text = ""
+        AddAdminInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+        AddAdminInput.PlaceholderColor3 = Color3.fromRGB(120, 120, 140)
+        AddAdminInput.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+        AddAdminInput.Position = UDim2.new(0, 240, 0, 281)
+        AddAdminInput.Size = UDim2.new(0, 212, 0, 28)
+        AddAdminInput.Font = Enum.Font.Code
+        AddAdminInput.TextSize = 10
+        Instance.new("UICorner", AddAdminInput).CornerRadius = UDim.new(0, 6)
+
+        local AddAdminBtn = Instance.new("TextButton", Container)
+        AddAdminBtn.Name = "AddAdminBtn"
+        AddAdminBtn.Text = "SALVAR"
+        AddAdminBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        AddAdminBtn.TextSize = 10
+        AddAdminBtn.Font = Enum.Font.Code
+        AddAdminBtn.BackgroundColor3 = Color3.fromRGB(40, 160, 90)
+        AddAdminBtn.Position = UDim2.new(0, 456, 0, 281)
+        AddAdminBtn.Size = UDim2.new(0, 96, 0, 28)
+        Instance.new("UICorner", AddAdminBtn).CornerRadius = UDim.new(0, 6)
+
+        AddAdminBtn.MouseButton1Click:Connect(function()
+            local textoVal = AddAdminInput.Text
+            if textoVal ~= "" then
+                pcall(function()
+                    request({
+                        Url = FIREBASE_URL .. "admins/" .. textoVal .. ".json",
+                        Method = "PUT",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body = HttpService:JSONEncode({ addedBy = username, timestamp = os.time() })
+                    })
+                end)
+                AddAdminInput.Text = "Adicionado!"
+                task.wait(1.5)
+                AddAdminInput.Text = ""
+            end
+        end)
+    end
+
+    -- Caixa de Texto do Chat Global
+    local posYInput = isAdmin and 314 or 256
+    local ChatInput = Instance.new("TextBox", Container)
+    ChatInput.Name = "ChatInput"
+    ChatInput.PlaceholderText = "Mensagem global... (Enter)"
+    ChatInput.Text = ""
+    ChatInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ChatInput.PlaceholderColor3 = Color3.fromRGB(100, 100, 120)
+    ChatInput.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+    ChatInput.Position = UDim2.new(0, 240, 0, posYInput)
+    ChatInput.Size = UDim2.new(0, 312, 0, 44)
+    ChatInput.Font = Enum.Font.Code
+    ChatInput.TextSize = 11
+    Instance.new("UICorner", ChatInput).CornerRadius = UDim.new(0, 8)
+
+     -- =========================================================
+    -- FUNÇÃO PARA ABRIR O MODAL DE REPORTAR MENSAGEM
+    -- =========================================================
+    local function abrirJanelaReport(msgData)
+        if CoreGui:FindFirstChild("TSEReportUI") then
+            CoreGui.TSEReportUI:Destroy()
+        end
+
+        local ReportGui = Instance.new("ScreenGui")
+        ReportGui.Name = "TSEReportUI"
+        ReportGui.Parent = CoreGui
+        ReportGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+        local ReportFrame = Instance.new("Frame", ReportGui)
+        ReportFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 25)
+        ReportFrame.BackgroundTransparency = 0.05
+        ReportFrame.BorderSizePixel = 0
+        ReportFrame.Position = UDim2.new(0.5, -175, 0.5, -110)
+        ReportFrame.Size = UDim2.new(0, 350, 0, 220)
+        Instance.new("UICorner", ReportFrame).CornerRadius = UDim.new(0, 10)
+
+        local RStroke = Instance.new("UIStroke", ReportFrame)
+        RStroke.Color = Color3.fromRGB(255, 120, 0)
+        RStroke.Transparency = 0.4
+        RStroke.Thickness = 1.5
+
+        local RTopBar = Instance.new("Frame", ReportFrame)
+        RTopBar.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+        RTopBar.Size = UDim2.new(1, 0, 0, 30)
+        Instance.new("UICorner", RTopBar).CornerRadius = UDim.new(0, 10)
+
+        local RTitle = Instance.new("TextLabel", RTopBar)
+        RTitle.Text = " ⚠️ REPORTAR MENSAGEM"
+        RTitle.TextColor3 = Color3.fromRGB(255, 120, 0)
+        RTitle.TextSize = 11
+        RTitle.Font = Enum.Font.Code
+        RTitle.Size = UDim2.new(1, -10, 1, 0)
+        RTitle.Position = UDim2.new(0, 8, 0, 0)
+        RTitle.BackgroundTransparency = 1
+        RTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+        local CloseReportBtn = Instance.new("TextButton", RTopBar)
+        CloseReportBtn.Name = "CloseReport"
+        CloseReportBtn.Text = "X"
+        CloseReportBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        CloseReportBtn.TextSize = 12
+        CloseReportBtn.Font = Enum.Font.Code
+        CloseReportBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+        CloseReportBtn.Position = UDim2.new(1, -28, 0, 3)
+        CloseReportBtn.Size = UDim2.new(0, 24, 0, 24)
+        Instance.new("UICorner", CloseReportBtn).CornerRadius = UDim.new(0, 4)
+        CloseReportBtn.MouseButton1Click:Connect(function()
+            ReportGui:Destroy()
+        end)
+
+        local InfoLabel = Instance.new("TextLabel", ReportFrame)
+        InfoLabel.BackgroundTransparency = 1
+        InfoLabel.Position = UDim2.new(0, 12, 0, 38)
+        InfoLabel.Size = UDim2.new(1, -24, 0, 45)
+        InfoLabel.Font = Enum.Font.Code
+        InfoLabel.TextSize = 10
+        InfoLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+        InfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+        InfoLabel.TextYAlignment = Enum.TextYAlignment.Top
+        InfoLabel.TextWrapped = true
+        InfoLabel.Text = string.format("Autor: @%s\nMensagem: \"%s\"", tostring(msgData.username), tostring(msgData.message))
+
+        local ReasonInput = Instance.new("TextBox", ReportFrame)
+        ReasonInput.PlaceholderText = "Digite o motivo do report..."
+        ReasonInput.Text = ""
+        ReasonInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+        ReasonInput.PlaceholderColor3 = Color3.fromRGB(120, 120, 140)
+        ReasonInput.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+        ReasonInput.Position = UDim2.new(0, 12, 0, 92)
+        ReasonInput.Size = UDim2.new(1, -24, 0, 68)
+        ReasonInput.Font = Enum.Font.Code
+        ReasonInput.TextSize = 10
+        ReasonInput.TextWrapped = true
+        ReasonInput.TextYAlignment = Enum.TextYAlignment.Top
+        Instance.new("UICorner", ReasonInput).CornerRadius = UDim.new(0, 6)
+
+        local EnviarReportBtn = Instance.new("TextButton", ReportFrame)
+        EnviarReportBtn.Text = "ENVIAR DENÚNCIA"
+        EnviarReportBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        EnviarReportBtn.TextSize = 10
+        EnviarReportBtn.Font = Enum.Font.Code
+        EnviarReportBtn.BackgroundColor3 = Color3.fromRGB(200, 80, 40)
+        EnviarReportBtn.Position = UDim2.new(0, 12, 1, -42)
+        EnviarReportBtn.Size = UDim2.new(1, -24, 0, 30)
+        Instance.new("UICorner", EnviarReportBtn).CornerRadius = UDim.new(0, 6)
+
+        EnviarReportBtn.MouseButton1Click:Connect(function()
+            local razao = ReasonInput.Text
+            if razao == "" then razao = "Sem motivo especificado" end
+
+            pcall(function()
+                request({
+                    Url = FIREBASE_URL .. "reports.json",
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode({
+                        reportedUserId = msgData.userId,
+                        reportedUsername = msgData.username,
+                        reportedDisplayName = msgData.displayName,
+                        messageReported = msgData.message,
+                        reporterUserId = userId,
+                        reporterUsername = username,
+                        reason = razao,
+                        timestamp = os.time()
+                    })
+                })
+            end)
+
+            ReportGui:Destroy()
+        end)
+    end
+
+    -- =========================================================
+    -- SISTEMA DE ARRASTAR (DRAG)
+    -- =========================================================
+    local dragging, dragInput, dragStart, startPos
+
+    TopBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = MainFrame.Position
+            
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    TopBar.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            MainFrame.Position = UDim2.new(
+                startPos.X.Scale, 
+                startPos.X.Offset + delta.X, 
+                startPos.Y.Scale, 
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+   -- =========================================================
+    -- BOTÃO MINIMIZAR
+    -- =========================================================
+    local minimized = false
+    MinimizeBtn.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        Container.Visible = not minimized
+        local tsizeY = isAdmin and 450 or 340
+        if minimized then
+            MinimizeBtn.Text = "+"
+            MainFrame.Size = UDim2.new(0, 560, 0, 32)
+        else
+            MinimizeBtn.Text = "-"
+            MainFrame.Size = UDim2.new(0, 560, 0, tsizeY)
+        end
+    end)
+
+    -- =========================================================
+    -- LÓGICA DE DADOS E SINCRONIZAÇÃO
+    -- =========================================================
+    local function getMinhaThumbnail()
+        local success, url = pcall(function()
+            return Players:GetUserThumbnailAsync(LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
+        end)
+        return success and url or ""
+    end
+
+    ChatInput.FocusLost:Connect(function(enterPressed)
+        if not enterPressed then return end
+        local texto = ChatInput.Text
+        if texto == "" then return end
+        ChatInput.Text = ""
+        
+        -- Checa banimento antes de enviar
+        local sBan, resBan = pcall(function() return game:HttpGet(FIREBASE_URL .. "bans/" .. userId .. ".json") end)
+        if sBan and resBan ~= "null" and resBan ~= "" then
+            local sucessoDec, dadosBan = pcall(function() return HttpService:JSONDecode(resBan) end)
+            if sucessoDec and type(dadosBan) == "table" then
+                if dadosBan.permanent == true or (tonumber(dadosBan.expiresAt) and os.time() < tonumber(dadosBan.expiresAt)) then
+                    return 
+                end
+            end
+        end
+
+        pcall(function()
+            request({
+                Url = FIREBASE_URL .. "chat.json",
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = HttpService:JSONEncode({
+                    userId = userId,
+                    displayName = LocalPlayer.DisplayName,
+                    username = username,
+                    message = texto,
+                    avatarUrl = getMinhaThumbnail(),
+                    timestamp = os.time()
+                })
+            })
+        end)
+    end)
+
+    -- Presença Online
+    task.spawn(function()
+        while ScreenGui.Parent do
+            pcall(function()
+                request({
+                    Url = FIREBASE_URL .. "presence/" .. userId .. ".json",
+                    Method = "PUT",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode({ name = username, lastSeen = os.time() })
+                })
+            end)
+            task.wait(15)
+        end
+    end)
+
+local lastChatSnapshot = nil
+local lastChatRender = 0
+local adminMessageCache = {}
+local function isMessageFromAdmin(msg)
+    local name = tostring(msg.username or ""):lower()
+    if name == "sxuwxzjdfrysxcf" or name == "kolyaname11alt_dev" then
+        return true
+    end
+    local id = tostring(msg.userId or "")
+    if not id:match("^%d+$") then return false end
+    local cached = adminMessageCache[id]
+    if cached and os.clock() - cached.checked < 60 then
+        return cached.value
+    end
+    local ok, response = pcall(function()
+        return game:HttpGet(FIREBASE_URL .. "admins/" .. id .. ".json")
+    end)
+    local value = false
+    if ok and type(response) == "string" then
+        local decodedOk, decoded = pcall(function()
+            return HttpService:JSONDecode(response)
+        end)
+        value = decodedOk and decoded == true
+    end
+    adminMessageCache[id] = {value = value, checked = os.clock()}
+    return value
+end
+local lastCleanup = 0
+-- LOOP 1: CHAT GLOBAL E ONLINE (Atualiza a cada 2 segundos)
+    task.spawn(function()
+        while ScreenGui.Parent do
+            local sBCheck, rBCheck = pcall(function() return game:HttpGet(FIREBASE_URL .. "bans/" .. userId .. ".json") end)
+            if sBCheck and rBCheck ~= "null" and rBCheck ~= "" then
+                local sucessoDec, dadosBan = pcall(function() return HttpService:JSONDecode(rBCheck) end)
+                if sucessoDec and type(dadosBan) == "table" then
+                    local agora = os.time()
+                    if dadosBan.permanent == true then
+                        ChatInput.PlaceholderText = "⚠️ BAN PERMANENTE: " .. (dadosBan.reason or "Conduta inadequada")
+                        ChatInput.TextEditable = false
+                    elseif tonumber(dadosBan.expiresAt) and agora < tonumber(dadosBan.expiresAt) then
+                        local tempoRestante = math.ceil((tonumber(dadosBan.expiresAt) - agora) / 60)
+                        ChatInput.PlaceholderText = string.format("⚠️ Banido temporariamente (%d min restantes).", tempoRestante)
+                        ChatInput.TextEditable = false
+                    else
+                        ChatInput.PlaceholderText = "Mensagem global... (Enter)"
+                        ChatInput.TextEditable = true
+                    end
+                end
+            else
+                ChatInput.PlaceholderText = "Mensagem global... (Enter)"
+                ChatInput.TextEditable = true
+            end
+
+            local sPres, resPres = pcall(function() return game:HttpGet(FIREBASE_URL .. "presence.json") end)
+            if sPres and resPres ~= "null" then
+                local pData = safeDecode(resPres)
+                local online = 0
+                local agora = os.time()
+                for _, u in pairs(type(pData) == "table" and pData or {}) do
+                    if type(u) == "table" and (agora - (tonumber(u.lastSeen) or 0)) <= 30 then online = online + 1 end
+                end
+                OnlineBtn.Text = "ONLINE: " .. online .. " 🟢"
+            end
+
+            local sChat, resChat = pcall(function() return game:HttpGet(FIREBASE_URL .. "chat.json") end)
+            if sChat and (resChat == "null" or resChat == "" or resChat ~= lastChatSnapshot or os.clock() - lastChatRender >= 30) then
+                local chatData = safeDecode(resChat)
+                lastChatSnapshot = resChat
+                lastChatRender = os.clock()
+                local agora = os.time()
+                
+                for _, child in ipairs(ChatScroll:GetChildren()) do
+                    if child:IsA("Frame") then child:Destroy() end
+                end
+                
+                local listaMensagens = {}
+                for id, msg in pairs(type(chatData) == "table" and chatData or {}) do
+                    if type(msg) == "table" and tonumber(msg.timestamp) then
+                        if (agora - tonumber(msg.timestamp)) <= 300 then
+                            msg.id = id
+                            table.insert(listaMensagens, msg)
+                        elseif os.clock() - lastCleanup >= 30 then
+                            lastCleanup = os.clock()
+                            task.spawn(function()
+                                local ok, err = pcall(function()
+                                    request({ Url = FIREBASE_URL .. "chat/" .. tostring(id) .. ".json", Method = "DELETE" })
+                                end)
+                                if not ok then warn("[TSE] Cleanup failed:", err) end
+                            end)
+                        end
+                    end
+                end
+                
+                table.sort(listaMensagens, function(a, b)
+                    return tonumber(a.timestamp) < tonumber(b.timestamp)
+                end)
+                
+                for _, msg in ipairs(listaMensagens) do
+                    local MsgItem = Instance.new("Frame", ChatScroll)
+                    local adminMessage = isMessageFromAdmin(msg)
+                    MsgItem.BackgroundColor3 = adminMessage and Color3.fromRGB(36, 43, 65) or Color3.fromRGB(30, 30, 45)
+                    if adminMessage then
+                        local border = Instance.new("UIStroke", MsgItem)
+                        border.Color = Color3.fromRGB(245, 190, 65)
+                        border.Thickness = 1.5
+                        local accent = Instance.new("Frame", MsgItem)
+                        accent.Name = "AdminAccent"
+                        accent.BorderSizePixel = 0
+                        accent.BackgroundColor3 = Color3.fromRGB(245, 190, 65)
+                        accent.Position = UDim2.fromOffset(0, 5)
+                        accent.Size = UDim2.new(0, 3, 1, -10)
+                        Instance.new("UICorner", accent).CornerRadius = UDim.new(1, 0)
+                    end
+                    MsgItem.Size = UDim2.new(1, 0, 0, 38)
+                    Instance.new("UICorner", MsgItem).CornerRadius = UDim.new(0, 6)
+                    
+                    local Avatar = Instance.new("ImageLabel", MsgItem)
+                    Avatar.BackgroundTransparency = 1
+                    Avatar.Position = UDim2.new(0, 4, 0, 5)
+                    Avatar.Size = UDim2.new(0, 28, 0, 28)
+                    Avatar.Image = msg.avatarUrl or ""
+                    Instance.new("UICorner", Avatar).CornerRadius = UDim.new(1, 0)
+                    
+                    local TextContent = Instance.new("TextLabel", MsgItem)
+                    TextContent.BackgroundTransparency = 1
+                    TextContent.Position = UDim2.new(0, 36, 0, 2)
+                    local tWidth = -40
+                    if isAdmin then tWidth = -75 else if tostring(msg.userId) ~= userId then tWidth = -75 end end
+                    TextContent.Size = UDim2.new(1, tWidth, 1, -4)
+                    TextContent.Font = Enum.Font.Code
+                    TextContent.TextSize = 10
+                    TextContent.TextColor3 = Color3.fromRGB(240, 240, 240)
+                    TextContent.TextXAlignment = Enum.TextXAlignment.Left
+                    TextContent.TextYAlignment = Enum.TextYAlignment.Top
+                    TextContent.TextWrapped = true
+                    
+                    local horaFormatada = os.date("%H:%M", tonumber(msg.timestamp) or os.time())
+                    local dName = msg.displayName or "Desconhecido"
+                    local uName = msg.username or "user"
+                    
+                    if adminMessage then
+                        TextContent.TextColor3 = Color3.fromRGB(255, 231, 170)
+                        TextContent.Text = string.format("★ ADMIN  [%s] %s (@%s): %s", horaFormatada, dName, uName, tostring(msg.message or ""))
+                    else
+                        TextContent.Text = string.format("[%s] %s (@%s): %s", horaFormatada, dName, uName, tostring(msg.message or ""))
+                    end
+
+                    if isAdmin and msg.userId then
+                        local BanBtn = Instance.new("TextButton", MsgItem)
+                        BanBtn.Text = "WARN"
+                        BanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        BanBtn.TextSize = 9
+                        BanBtn.Font = Enum.Font.Code
+                        BanBtn.BackgroundColor3 = Color3.fromRGB(200, 100, 40)
+                        BanBtn.Position = UDim2.new(1, -34, 0, 7)
+                        BanBtn.Size = UDim2.new(0, 28, 0, 24)
+                        Instance.new("UICorner", BanBtn).CornerRadius = UDim.new(0, 4)
+
+                        BanBtn.MouseButton1Click:Connect(function()
+                            pcall(function()
+                                local alvoId = tostring(msg.userId)
+                                local atualWarns = 0
+                                
+                                local sW, rW = pcall(function() return game:HttpGet(FIREBASE_URL .. "bans/" .. alvoId .. ".json") end)
+                                if sW and rW ~= "null" and rW ~= "" then
+                                    local decW = HttpService:JSONDecode(rW)
+                                    if type(decW) == "table" and decW.warns then
+                                        atualWarns = tonumber(decW.warns) or 0
+                                    end
+                                end
+
+                                atualWarns = atualWarns + 1
+                                local agoraTime = os.time()
+                                local dadosBanimento = {
+                                    bannedBy = username,
+                                    reason = "Violação das regras / Odio no chat",
+                                    warns = atualWarns,
+                                    permanent = false,
+                                    expiresAt = 0,
+                                    time = agoraTime
+                                }
+
+                                if atualWarns >= 9 then
+                                    dadosBanimento.permanent = true
+                                    dadosBanimento.reason = "Atingiu 9 advertências (Ban Permanente)"
+                                elseif atualWarns >= 6 then
+                                    dadosBanimento.expiresAt = agoraTime + (10 * 60)
+                                    dadosBanimento.reason = "Atingiu 6 advertências (Ban 10 min)"
+                                elseif atualWarns >= 3 then
+                                    dadosBanimento.expiresAt = agoraTime + (5 * 60)
+                                    dadosBanimento.reason = "Atingiu 3 advertências (Ban 5 min)"
+                                end
+
+                                request({
+                                    Url = FIREBASE_URL .. "bans/" .. alvoId .. ".json",
+                                    Method = "PUT",
+                                    Headers = { ["Content-Type"] = "application/json" },
+                                    Body = HttpService:JSONEncode(dadosBanimento)
+                                })
+
+                                request({
+                                    Url = FIREBASE_URL .. "chat/" .. tostring(msg.id) .. ".json",
+                                    Method = "DELETE"
+                                })
+                            end)
+                        end)
+                    elseif not isAdmin and msg.userId and tostring(msg.userId) ~= userId then
+                        local ReportBtn = Instance.new("TextButton", MsgItem)
+                        ReportBtn.Text = "REPORT"
+                        ReportBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        ReportBtn.TextSize = 8
+                        ReportBtn.Font = Enum.Font.Code
+                        ReportBtn.BackgroundColor3 = Color3.fromRGB(220, 100, 30)
+                        ReportBtn.Position = UDim2.new(1, -34, 0, 7)
+                        ReportBtn.Size = UDim2.new(0, 30, 0, 24)
+                        Instance.new("UICorner", ReportBtn).CornerRadius = UDim.new(0, 4)
+
+                        ReportBtn.MouseButton1Click:Connect(function()
+                            abrirJanelaReport(msg)
+                        end)
+                    end
+                end
+                ChatScroll.CanvasSize = UDim2.new(0, 0, 0, ChatLayout.AbsoluteContentSize.Y + 10)
+            end
+
+            task.wait(2)
+        end
+    end)
+
+-- LOOP 2: APURAÇÃO DO TSE E FOTOS
+    task.spawn(function()
+        while ScreenGui.Parent do
+            local sucessoReq, resTSE = pcall(function()
+                return request({
+                    Url = "https://resultados.tse.jus.br/oficial/ele2026/6257/dados/br/br-c0001-e006257-u.json",
+                    Method = "GET",
+                    Headers = { ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+                })
+            end)
+
+            if sucessoReq and resTSE and resTSE.StatusCode == 200 then
+                local sucessoDec, dadosJson = pcall(function()
+                    return HttpService:JSONDecode(resTSE.Body)
+                end)
+
+                if sucessoDec and type(dadosJson) == "table" and type(dadosJson.carg) == "table" then
+                    if type(dadosJson) == "table" and type(dadosJson.s) == "table" and dadosJson.s.pst then
+                        UrnasInfo.Text = string.format("🗳️ Urnas apuradas: %s%%", dadosJson.s.pst)
+                    end
+
+                    -- JSON oficial TSE: totais em dadosJson.v; abstencoes em dadosJson.e.
+                    -- Os percentuais sao strings com virgula (ex.: "95,23").
+                    local votosGerais = type(dadosJson.v) == "table" and dadosJson.v or {}
+                    local eleitorado = type(dadosJson.e) == "table" and dadosJson.e or {}
+                    local function readNumber(obj, key)
+                        if type(obj) ~= "table" then return nil end
+                        local value = obj[key]
+                        if value == nil then return nil end
+                        local normalized = tostring(value):gsub("%s+", ""):gsub(",", ".")
+                        return tonumber(normalized)
+                    end
+                    local function displayNumber(n)
+                        return n ~= nil and formatarNumero(math.floor(n)) or "—"
+                    end
+                    local function displayPercent(value)
+                        if value == nil or tostring(value) == "" then return "—" end
+                        return tostring(value):gsub("%.", ",") .. "%"
+                    end
+                    local valid = readNumber(votosGerais, "vv")
+                    local nullVotes = readNumber(votosGerais, "tvn") or readNumber(votosGerais, "vn")
+                    local blank = readNumber(votosGerais, "vb")
+                    local total = readNumber(votosGerais, "tv")
+                    local computed = readNumber(votosGerais, "vvc")
+                    local pctValid = votosGerais.pvvc
+                    local pctNull = votosGerais.ptvn
+                    local pctBlank = votosGerais.pvb
+                    local pctComputed = votosGerais.pvvc
+                    local abstentions = readNumber(eleitorado, "a")
+                    StatsInfo.Text = string.format(
+                        "Válidos: %s (%s)\nNulos: %s (%s)\nBrancos: %s (%s)\nTotal: %s\nComputados: %s (%s)\nAbstenções: %s",
+                        displayNumber(valid), displayPercent(pctValid),
+                        displayNumber(nullVotes), displayPercent(pctNull),
+                        displayNumber(blank), displayPercent(pctBlank),
+                        displayNumber(total), displayNumber(computed), displayPercent(pctComputed),
+                        displayNumber(abstentions)
+                    )
+
+                    for _, child in ipairs(CandidatosScroll:GetChildren()) do
+                        if child:IsA("Frame") then child:Destroy() end
+                    end
+
+                    if type(dadosJson) == "table" and type(dadosJson.carg) == "table" then
+                        for _, cargo in ipairs(dadosJson.carg) do
+                            if tostring(cargo.cd) == "1" and type(cargo.agr) == "table" then
+                                for _, agrupamento in ipairs(cargo.agr) do
+                                    if type(agrupamento.par) == "table" then
+                                        for _, partido in ipairs(agrupamento.par) do
+                                            if type(partido.cand) == "table" then
+                                                for _, c in ipairs(partido.cand) do
+                                                    if type(c.nmu) == "string" and (c.nmu == "LULA" or c.nmu == "FLAVIO BOLSONARO" or c.nmu:find("BOLSONARO")) then
+                                                        local candidateKey = tostring(c.sqcand or c.sqcan or c.nmu)
+                                                        local CandItem = Instance.new("Frame", CandidatosScroll)
+                                                        CandItem.Name = "Candidate_" .. candidateKey
+                                                        CandItem.BackgroundColor3 = Color3.fromRGB(28, 28, 42)
+                                                        CandItem.BorderSizePixel = 0
+                                                        CandItem.Size = UDim2.new(1, -5, 0, 78)
+                                                        CandItem.LayoutOrder = 100000000 - (tonumber(c.vap) or 0)
+                                                        Instance.new("UICorner", CandItem).CornerRadius = UDim.new(0, 6)
+
+                                                        local CandAvatar = Instance.new("ImageLabel", CandItem)
+                                                        CandAvatar.Name = "CandidatePhoto"
+                                                        CandAvatar.BackgroundTransparency = 1
+                                                        CandAvatar.Position = UDim2.new(0, 7, 0, 8)
+                                                        CandAvatar.Size = UDim2.fromOffset(46, 46)
+                                                        CandAvatar.ScaleType = Enum.ScaleType.Crop
+                                                        Instance.new("UICorner", CandAvatar).CornerRadius = UDim.new(0, 5)
+                                                        CandAvatar:SetAttribute("CandidateId", candidateKey)
+                                                        getCandidatePhoto(candidateKey, CandAvatar)
+
+                                                        local CandText = Instance.new("TextLabel", CandItem)
+                                                        CandText.Name = "CandidateNameAndVotes"
+                                                        CandText.BackgroundTransparency = 1
+                                                        CandText.Position = UDim2.new(0, 61, 0, 7)
+                                                        CandText.Size = UDim2.new(1, -68, 0, 64)
+                                                        CandText.Font = Enum.Font.Code
+                                                        CandText.TextSize = 10
+                                                        CandText.TextColor3 = Color3.fromRGB(235, 235, 240)
+                                                        CandText.TextXAlignment = Enum.TextXAlignment.Left
+                                                        CandText.TextYAlignment = Enum.TextYAlignment.Center
+                                                        CandText.TextWrapped = true
+                                                        CandText.TextTruncate = Enum.TextTruncate.AtEnd
+                                                        local votosFmt = displayNumber(readNumber(c, "vap"))
+                                                        local statusStr = (c.st and c.st ~= "") and tostring(c.st) or "2º Turno"
+                                                        CandText.Text = string.format("%s\n%s (%s votos)", tostring(c.nmu), displayPercent(c.pvap), votosFmt)
+
+
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    updateCandidateCanvas()
+                end
+            end
+
+            task.wait(60)
+        end
+    end)
+end
+
+-- =========================================================
+-- JANELA DE REGRAS (EXIBIDA APENAS NA PRIMEIRA VEZ)
+-- =========================================================
+if jaAceitouRegras() then
+    iniciarPainelPrincipal()
+else
+    local RegrasGui = Instance.new("ScreenGui")
+    RegrasGui.Name = "TSERegrasUI"
+    RegrasGui.Parent = CoreGui
+    RegrasGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local RegrasFrame = Instance.new("Frame", RegrasGui)
+    RegrasFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 25)
+    RegrasFrame.BackgroundTransparency = 0.05
+    RegrasFrame.BorderSizePixel = 0
+    RegrasFrame.Position = UDim2.new(0.5, -205, 0.5, -155)
+    RegrasFrame.Size = UDim2.new(0, 410, 0, 310)
+    Instance.new("UICorner", RegrasFrame).CornerRadius = UDim.new(0, 10)
+
+    local RStroke = Instance.new("UIStroke", RegrasFrame)
+    RStroke.Color = Color3.fromRGB(0, 255, 204)
+    RStroke.Transparency = 0.4
+    RStroke.Thickness = 1.5
+
+    local RTopBar = Instance.new("Frame", RegrasFrame)
+    RTopBar.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+    RTopBar.Size = UDim2.new(1, 0, 0, 32)
+    Instance.new("UICorner", RTopBar).CornerRadius = UDim.new(0, 10)
+
+    local RTitle = Instance.new("TextLabel", RTopBar)
+    RTitle.Text = " 📜 TERMOS E REGRAS DE USO"
+    RTitle.TextColor3 = Color3.fromRGB(0, 255, 204)
+    RTitle.TextSize = 12
+    RTitle.Font = Enum.Font.Code
+    RTitle.Size = UDim2.new(1, -10, 1, 0)
+    RTitle.Position = UDim2.new(0, 8, 0, 0)
+    RTitle.BackgroundTransparency = 1
+    RTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+    local RTextoBox = Instance.new("TextLabel", RegrasFrame)
+    RTextoBox.BackgroundTransparency = 1
+    RTextoBox.Position = UDim2.new(0, 15, 0, 40)
+    RTextoBox.Size = UDim2.new(1, -30, 0, 190)
+    RTextoBox.Font = Enum.Font.Code
+    RTextoBox.TextSize = 10.5
+    RTextoBox.TextColor3 = Color3.fromRGB(220, 220, 230)
+    RTextoBox.TextXAlignment = Enum.TextXAlignment.Left
+    RTextoBox.TextYAlignment = Enum.TextYAlignment.Top
+    RTextoBox.TextWrapped = true
+    RTextoBox.Text = "Bem-vindo ao painel das Eleições 2026!\n\n" ..
+                    "• RESENHA LIBERADA: A zoeira e a discussão política saudável são permitidas!\n" ..
+                    "• BRIGAS POR CAUSA DE LADO NÃO SÃO TOLERADAS, reporte assim que puder: clique na mensagem > reportar no chat global e digite a razão. (REPORTE POR ZOEIRA VAI LEVAR CONSEQUÊNCIAS).\n" ..
+                    "• SISTEMA DE ADVERTÊNCIAS (WARNS):\n" ..
+                    "  - 3 Warns = Ban temporário (5 minutos)\n" ..
+                    "  - 6 Warns = Ban temporário (10 minutos)\n" ..
+                    "  - 9 Warns = Ban permanente"
+
+    local AceitarBtn = Instance.new("TextButton", RegrasFrame)
+    AceitarBtn.Text = "ESTOU CIENTE E CONCORDO"
+    AceitarBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    AceitarBtn.TextSize = 11
+    AceitarBtn.Font = Enum.Font.Code
+    AceitarBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 140)
+    AceitarBtn.Position = UDim2.new(0, 15, 1, -45)
+    AceitarBtn.Size = UDim2.new(1, -30, 0, 32)
+    Instance.new("UICorner", AceitarBtn).CornerRadius = UDim.new(0, 6)
+
+    AceitarBtn.MouseButton1Click:Connect(function()
+        pcall(function()
+            if writefile then
+                writefile(ARQUIVO_REGRAS, HttpService:JSONEncode({ aceito = true, timestamp = os.time() }))
+            end
+        end)
+        RegrasGui:Destroy()
+        iniciarPainelPrincipal()
+    end)
+end
